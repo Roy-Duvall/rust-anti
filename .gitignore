@@ -1,0 +1,167 @@
+# ============================================================
+# PowerShell project .gitignore
+# ============================================================
+
+# --- PowerShell / Pester test results and coverage ---
+TestResults/
+test-results/
+coverage/
+coverage.xml
+*.coverage.xml
+*.coverage.json
+*.trx
+*.clixml
+
+# Pester-generated output and temporary test files
+PesterOutput/
+PesterTestResults.xml
+PesterTestResults.junit.xml
+
+# --- Local module dependencies ---
+# Keep module source in Git only if it is intentionally vendored.
+Modules/
+modules/
+PSModules/
+psmodules/
+
+# PowerShell module build/package output
+Output/
+output/
+Build/
+build/
+Dist/
+dist/
+Artifacts/
+artifacts/
+Release/
+release/
+Publish/
+publish/
+Package/
+package/
+packages/
+*.nupkg
+
+# --- Local configuration and environment-specific files ---
+# Commit a safe example instead: config.example.psd1, .env.example, etc.
+.env
+.env.*
+!.env.example
+!.env.template
+
+config.local.psd1
+config.local.ps1
+settings.local.psd1
+settings.local.ps1
+appsettings.local.json
+secrets.psd1
+secrets.ps1
+credentials.psd1
+credentials.ps1
+
+# Certificates, private keys, and sensitive exports
+*.pfx
+*.p12
+*.pem
+*.key
+*.cer
+*.crt
+
+# --- Logs, temp files, caches ---
+*.log
+logs/
+Logs/
+temp/
+Temp/
+tmp/
+Tmp/
+cache/
+Cache/
+*.tmp
+*.bak
+*.old
+*.orig
+
+# PowerShell history and local state
+ConsoleHost_history.txt
+PSReadLine/
+PowerShell/
+.pshistory/
+.history/
+
+# --- Visual Studio Code ---
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# --- Visual Studio ---
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# --- JetBrains / Rider ---
+.idea/
+*.sln.iml
+
+# --- Windows files ---
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# --- macOS / Linux files ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+*~
+.nfs*
+
+# --- Python virtual environments, if your scripts use Python tools ---
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# --- Node.js files, if the project has a web UI/build step ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Open WebUI / local-AI style project data ---
+data/
+Data/
+uploads/
+Uploads/
+vector_db/
+chroma/
+models/
+ModelCache/
+downloads/
+Downloads/
+
+# --- Backup and archive files ---
+*.zip
+*.7z
+*.rar
+*.tar
+*.gz
+*.bz2
+
+# --- Terraform / cloud credentials, if applicable ---
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+terraform.tfvars.json

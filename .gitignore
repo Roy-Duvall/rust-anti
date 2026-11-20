@@ -164,4 +164,4 @@ Downloads/
 *.tfstate
 *.tfstate.*
 terraform.tfvars
-terraform.tfvars.json
+terraform.tfvars.json/.worktrees/

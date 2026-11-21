@@ -7,6 +7,14 @@ edition = "2021"
 native-windows-gui = { version = "1.0.13", features = ["all"] }
 serde_json = "1.0"
 walkdir = "2.5"
+winapi = { version = "0.3.9", features = [
+    "shobjidl",
+    "shobjidl_core",
+    "combaseapi",
+    "objidl",
+    "winerror",
+    "ntdef"
+] }
 windows-sys = { version = "0.59", features = [
     "Win32_Security",
     "Win32_System_Threading",

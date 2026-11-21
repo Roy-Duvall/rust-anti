@@ -9,6 +9,7 @@ dependencies = [
  "native-windows-gui",
  "serde_json",
  "walkdir",
+ "winapi",
  "windows-sys 0.59.0",
  "winres",
 ]

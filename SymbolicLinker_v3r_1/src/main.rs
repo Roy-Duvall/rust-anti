@@ -5,9 +5,30 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use walkdir::WalkDir;
+use winapi::shared::ntdef::PWSTR;
+use winapi::shared::winerror::S_OK;
+use winapi::shared::wtypesbase::CLSCTX_INPROC_SERVER;
+use winapi::um::combaseapi::{CoCreateInstance, CoTaskMemFree};
+use winapi::um::shobjidl::{
+    FOS_FILEMUSTEXIST, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FOS_SHAREAWARE,
+    IFileOpenDialog,
+};
+use winapi::um::shobjidl_core::{
+    CLSID_FileOpenDialog, IShellItem, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_FILESYSPATH,
+};
+use winapi::Interface;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING,
 };
+
+extern "system" {
+    fn SHCreateItemFromParsingName(
+        pszPath: winapi::shared::ntdef::PCWSTR,
+        pbc: *mut winapi::um::objidl::IBindCtx,
+        riid: winapi::shared::guiddef::REFIID,
+        ppv: *mut *mut winapi::ctypes::c_void,
+    ) -> winapi::shared::ntdef::HRESULT;
+}
 
 // Check if running with elevated Administrator privileges
 fn is_elevated() -> bool {
@@ -149,6 +170,183 @@ fn create_group_box(
     }
 }
 
+// Native Windows folder browser that fully supports browsing and selecting network connected PCs & shares
+fn pick_folder(parent: &nwg::Window, title: &str, current_path: &str) -> Option<String> {
+    unsafe {
+        let mut dialog: *mut IFileOpenDialog = std::ptr::null_mut();
+        if CoCreateInstance(
+            &CLSID_FileOpenDialog,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IFileOpenDialog::uuidof(),
+            std::mem::transmute(&mut dialog),
+        ) != S_OK
+        {
+            return None;
+        }
+
+        let fd = &mut *dialog;
+
+        // FOS_SHAREAWARE | FOS_PICKFOLDERS | FOS_PATHMUSTEXIST
+        // Notice: We intentionally DO NOT set FOS_FORCEFILESYSTEM so network connected PCs can be browsed
+        let flags = FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_SHAREAWARE;
+        let _ = fd.SetOptions(flags);
+
+        let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = fd.SetTitle(title_w.as_ptr());
+
+        // Default to "This PC" (contains local drives, mapped drives, and Network PCs)
+        let folder_to_set = if !current_path.trim().is_empty() {
+            let p = Path::new(current_path.trim());
+            if p.exists() {
+                current_path.trim().to_string()
+            } else {
+                ":::{20D04FE0-3AEA-1069-A2D8-08002B30309D}".to_string()
+            }
+        } else {
+            ":::{20D04FE0-3AEA-1069-A2D8-08002B30309D}".to_string()
+        };
+
+        let path_w: Vec<u16> = folder_to_set
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut shellitem: *mut IShellItem = std::ptr::null_mut();
+
+        if SHCreateItemFromParsingName(
+            path_w.as_ptr(),
+            std::ptr::null_mut(),
+            &IShellItem::uuidof(),
+            std::mem::transmute(&mut shellitem),
+        ) == S_OK
+        {
+            let _ = fd.SetFolder(&mut *shellitem);
+            let _ = fd.SetDefaultFolder(&mut *shellitem);
+            (&mut *shellitem).Release();
+        }
+
+        let parent_hwnd = match parent.handle {
+            nwg::ControlHandle::Hwnd(h) => h as winapi::shared::windef::HWND,
+            _ => std::ptr::null_mut(),
+        };
+
+        let mut result = None;
+        if fd.Show(parent_hwnd) == S_OK {
+            let mut result_item: *mut IShellItem = std::ptr::null_mut();
+            if fd.GetResult(&mut result_item) == S_OK {
+                let mut path_ptr: PWSTR = std::ptr::null_mut();
+                let hr = (&mut *result_item).GetDisplayName(SIGDN_FILESYSPATH, &mut path_ptr);
+                let hr = if hr != S_OK {
+                    (&mut *result_item)
+                        .GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &mut path_ptr)
+                } else {
+                    hr
+                };
+
+                if hr == S_OK && !path_ptr.is_null() {
+                    let len = (0..).take_while(|&i| *path_ptr.offset(i) != 0).count();
+                    let slice = std::slice::from_raw_parts(path_ptr, len);
+                    result = Some(String::from_utf16_lossy(slice));
+                    CoTaskMemFree(path_ptr as *mut _);
+                }
+                (&mut *result_item).Release();
+            }
+        }
+
+        fd.Release();
+        result
+    }
+}
+
+// Native Windows file browser that supports browsing and selecting network files
+fn pick_file(parent: &nwg::Window, title: &str, current_path: &str) -> Option<String> {
+    unsafe {
+        let mut dialog: *mut IFileOpenDialog = std::ptr::null_mut();
+        if CoCreateInstance(
+            &CLSID_FileOpenDialog,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IFileOpenDialog::uuidof(),
+            std::mem::transmute(&mut dialog),
+        ) != S_OK
+        {
+            return None;
+        }
+
+        let fd = &mut *dialog;
+
+        // FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_SHAREAWARE
+        let flags = FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_SHAREAWARE;
+        let _ = fd.SetOptions(flags);
+
+        let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = fd.SetTitle(title_w.as_ptr());
+
+        let folder_to_set = if !current_path.trim().is_empty() {
+            let p = Path::new(current_path.trim());
+            if p.is_file() {
+                p.parent().map(|parent| parent.to_string_lossy().to_string())
+            } else if p.is_dir() {
+                Some(current_path.trim().to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+        .unwrap_or_else(|| ":::{20D04FE0-3AEA-1069-A2D8-08002B30309D}".to_string());
+
+        let path_w: Vec<u16> = folder_to_set
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut shellitem: *mut IShellItem = std::ptr::null_mut();
+
+        if SHCreateItemFromParsingName(
+            path_w.as_ptr(),
+            std::ptr::null_mut(),
+            &IShellItem::uuidof(),
+            std::mem::transmute(&mut shellitem),
+        ) == S_OK
+        {
+            let _ = fd.SetFolder(&mut *shellitem);
+            let _ = fd.SetDefaultFolder(&mut *shellitem);
+            (&mut *shellitem).Release();
+        }
+
+        let parent_hwnd = match parent.handle {
+            nwg::ControlHandle::Hwnd(h) => h as winapi::shared::windef::HWND,
+            _ => std::ptr::null_mut(),
+        };
+
+        let mut result = None;
+        if fd.Show(parent_hwnd) == S_OK {
+            let mut result_item: *mut IShellItem = std::ptr::null_mut();
+            if fd.GetResult(&mut result_item) == S_OK {
+                let mut path_ptr: PWSTR = std::ptr::null_mut();
+                let hr = (&mut *result_item).GetDisplayName(SIGDN_FILESYSPATH, &mut path_ptr);
+                let hr = if hr != S_OK {
+                    (&mut *result_item)
+                        .GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &mut path_ptr)
+                } else {
+                    hr
+                };
+
+                if hr == S_OK && !path_ptr.is_null() {
+                    let len = (0..).take_while(|&i| *path_ptr.offset(i) != 0).count();
+                    let slice = std::slice::from_raw_parts(path_ptr, len);
+                    result = Some(String::from_utf16_lossy(slice));
+                    CoTaskMemFree(path_ptr as *mut _);
+                }
+                (&mut *result_item).Release();
+            }
+        }
+
+        fd.Release();
+        result
+    }
+}
+
 struct TemplateRow {
     _label: nwg::Label,
     input: nwg::TextInput,
@@ -245,8 +443,16 @@ impl App {
     }
 
     fn create_symbolic_links(&self) {
-        let src = self.source_input.text().trim_end_matches(['\\', '/']).to_string();
-        let dst = self.dest_input.text().trim_end_matches(['\\', '/']).to_string();
+        let src = self
+            .source_input
+            .text()
+            .trim_end_matches(['\\', '/'])
+            .to_string();
+        let dst = self
+            .dest_input
+            .text()
+            .trim_end_matches(['\\', '/'])
+            .to_string();
         let overwrite = self.overwrite_cb.check_state() == nwg::CheckBoxState::Checked;
 
         let src_path = Path::new(&src);
@@ -315,7 +521,8 @@ impl App {
                             if is_reparse_point(&target) {
                                 if overwrite {
                                     let _ = std::fs::remove_file(&target);
-                                    if std::os::windows::fs::symlink_file(entry_path, &target).is_ok() {
+                                    if std::os::windows::fs::symlink_file(entry_path, &target).is_ok()
+                                    {
                                         file_count += 1;
                                     } else {
                                         skipped_count += 1;
@@ -358,7 +565,8 @@ impl App {
                                 if is_reparse_point(&target) {
                                     if overwrite {
                                         let _ = std::fs::remove_file(&target);
-                                        if std::os::windows::fs::symlink_file(&path, &target).is_ok() {
+                                        if std::os::windows::fs::symlink_file(&path, &target).is_ok()
+                                        {
                                             file_count += 1;
                                         } else {
                                             skipped_count += 1;
@@ -520,9 +728,33 @@ fn main() {
         .expect("Failed to create main window");
 
     // Win32 GroupBoxes
-    create_group_box(&window, "Source Selection", 20, 15, 700, 95, Some(&bold_font));
-    create_group_box(&window, "Destination Selection", 20, 120, 700, 80, Some(&bold_font));
-    create_group_box(&window, "Saved Path Templates (1 - 9)", 20, 210, 700, 335, Some(&bold_font));
+    create_group_box(
+        &window,
+        "Source Selection",
+        20,
+        15,
+        700,
+        95,
+        Some(&bold_font),
+    );
+    create_group_box(
+        &window,
+        "Destination Selection",
+        20,
+        120,
+        700,
+        80,
+        Some(&bold_font),
+    );
+    create_group_box(
+        &window,
+        "Saved Path Templates (1 - 9)",
+        20,
+        210,
+        700,
+        335,
+        Some(&bold_font),
+    );
     create_group_box(&window, "Options", 20, 555, 700, 105, Some(&bold_font));
     create_group_box(&window, "Preview", 20, 670, 700, 80, Some(&bold_font));
 
@@ -826,46 +1058,17 @@ fn main() {
                 // Source browse button
                 if handle == app.source_browse_btn.handle {
                     let is_file = app.source_type_cb.selection() == Some(0);
-                    let mut dlg = Default::default();
-
                     let curr_text = app.source_input.text();
-                    let default_folder = if is_file {
-                        let path = Path::new(&curr_text);
-                        if path.exists() {
-                            path.parent().map(|p| p.to_string_lossy().to_string())
-                        } else {
-                            None
-                        }
+
+                    let selected = if is_file {
+                        pick_file(&app.window, "Select Source File", &curr_text)
                     } else {
-                        if Path::new(&curr_text).exists() {
-                            Some(curr_text.clone())
-                        } else {
-                            None
-                        }
+                        pick_folder(&app.window, "Select Source Directory", &curr_text)
                     };
 
-                    let mut builder = nwg::FileDialog::builder();
-                    if is_file {
-                        builder = builder
-                            .title("Select Source File")
-                            .action(nwg::FileDialogAction::Open);
-                    } else {
-                        builder = builder
-                            .title("Select Source Directory")
-                            .action(nwg::FileDialogAction::OpenDirectory);
-                    }
-
-                    if let Some(ref df) = default_folder {
-                        builder = builder.default_folder(df.clone());
-                    }
-
-                    if builder.build(&mut dlg).is_ok() {
-                        if dlg.run(Some(&app.window)) {
-                            if let Ok(item) = dlg.get_selected_item() {
-                                app.source_input.set_text(&item.to_string_lossy());
-                                app.update_preview();
-                            }
-                        }
+                    if let Some(path) = selected {
+                        app.source_input.set_text(&path);
+                        app.update_preview();
                     }
                     return;
                 }
@@ -873,28 +1076,11 @@ fn main() {
                 // Destination browse button
                 if handle == app.dest_browse_btn.handle {
                     let curr_text = app.dest_input.text();
-                    let default_folder = if Path::new(&curr_text).exists() {
-                        Some(curr_text.clone())
-                    } else {
-                        None
-                    };
-
-                    let mut dlg = Default::default();
-                    let mut builder = nwg::FileDialog::builder()
-                        .title("Select Destination Directory")
-                        .action(nwg::FileDialogAction::OpenDirectory);
-
-                    if let Some(ref df) = default_folder {
-                        builder = builder.default_folder(df.clone());
-                    }
-
-                    if builder.build(&mut dlg).is_ok() {
-                        if dlg.run(Some(&app.window)) {
-                            if let Ok(item) = dlg.get_selected_item() {
-                                app.dest_input.set_text(&item.to_string_lossy());
-                                app.update_preview();
-                            }
-                        }
+                    if let Some(path) =
+                        pick_folder(&app.window, "Select Destination Directory", &curr_text)
+                    {
+                        app.dest_input.set_text(&path);
+                        app.update_preview();
                     }
                     return;
                 }
@@ -903,27 +1089,10 @@ fn main() {
                 for row in &app.template_rows {
                     if handle == row.btn_browse.handle {
                         let curr_text = row.input.text();
-                        let default_folder = if Path::new(&curr_text).exists() {
-                            Some(curr_text.clone())
-                        } else {
-                            None
-                        };
-
-                        let mut dlg = Default::default();
-                        let mut builder = nwg::FileDialog::builder()
-                            .title("Select Folder for Template")
-                            .action(nwg::FileDialogAction::OpenDirectory);
-
-                        if let Some(ref df) = default_folder {
-                            builder = builder.default_folder(df.clone());
-                        }
-
-                        if builder.build(&mut dlg).is_ok() {
-                            if dlg.run(Some(&app.window)) {
-                                if let Ok(item) = dlg.get_selected_item() {
-                                    row.input.set_text(&item.to_string_lossy());
-                                }
-                            }
+                        if let Some(path) =
+                            pick_folder(&app.window, "Select Folder for Template", &curr_text)
+                        {
+                            row.input.set_text(&path);
                         }
                         return;
                     }

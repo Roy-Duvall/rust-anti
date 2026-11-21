@@ -165,3 +165,8 @@ Downloads/
 *.tfstate.*
 terraform.tfvars
 terraform.tfvars.json/.worktrees/
+
+
+# --- Rust build artifacts ---
+target/
+**/target/

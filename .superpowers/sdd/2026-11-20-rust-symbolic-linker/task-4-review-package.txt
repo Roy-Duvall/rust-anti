@@ -1,0 +1,198 @@
+af8bdce feat: add native symbolic-linker GUI
+ src/app.rs  | 172 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/main.rs |   1 +
+ 2 files changed, 173 insertions(+)
+diff --git a/src/app.rs b/src/app.rs
+new file mode 100644
+index 0000000..e4b492b
+--- /dev/null
++++ b/src/app.rs
+@@ -0,0 +1,172 @@
++use crate::linker::{LinkMode, plan_links};
++use crate::executor::{execute_plan, LinkSummary};
++use crate::config::{load_templates, save_templates};
++use eframe::egui;
++use rfd::FileDialog;
++
++#[derive(Clone)]
++pub struct TemplateData {
++    pub source: String,
++}
++
++pub struct SymbolicLinkApp {
++    pub source: String,
++    pub destination: String,
++    pub source_mode: LinkMode,
++    pub recursive: bool,
++    pub templates: Vec<TemplateData>,
++    pub force_save_failure: bool,
++    pub error_message: Option<String>,
++    pub summary: Option<LinkSummary>,
++}
++
++impl Default for SymbolicLinkApp {
++    fn default() -> Self {
++        let templates = load_templates().unwrap_or_else(|_| std::array::from_fn(|_| String::new()));
++        Self {
++            source: String::new(),
++            destination: String::new(),
++            source_mode: LinkMode::Directory { recursive: false },
++            recursive: false,
++            templates: templates.iter().map(|s| TemplateData { source: s.clone() }).collect(),
++            force_save_failure: false,
++            error_message: None,
++            summary: None,
++        }
++    }
++}
++
++impl SymbolicLinkApp {
++    pub fn update_mode(&mut self, mode: LinkMode) {
++        self.source_mode = mode.clone();
++        if let LinkMode::File = mode {
++            self.recursive = false;
++        }
++    }
++    pub fn get_preview(&self) -> String {
++        let mode_str = match self.source_mode {
++            LinkMode::File => "File",
++            LinkMode::Directory { recursive } => if recursive || self.recursive { "Recursive Directory" } else { "Directory" },
++        };
++        format!("Source: {}, Destination: {}, Mode: {}", self.source, self.destination, mode_str)
++    }
++    pub fn apply_template(&mut self, index: usize) {
++        if let Some(template) = self.templates.get(index) {
++            self.source = template.source.clone();
++        }
++    }
++    pub fn close(&mut self) -> Result<(), ()> {
++        let templates: Vec<String> = self.templates.iter().map(|t| t.source.clone()).collect();
++        let templates_array: [String; 9] = templates.try_into().map_err(|_| ())?;
++        if self.force_save_failure || save_templates(&templates_array).is_err() {
++            self.error_message = Some("Save failed".to_string());
++            return Err(());
++        }
++        Ok(())
++    }
++}
++
++impl eframe::App for SymbolicLinkApp {
++    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
++        egui::CentralPanel::default().show(ctx, |ui| {
++            ui.heading("Symbolic Link Creator v2.8");
++            
++            ui.horizontal(|ui| {
++                ui.label("Source:");
++                ui.text_edit_singleline(&mut self.source);
++                if ui.button("Browse").clicked() {
++                    if let Some(path) = FileDialog::new().pick_folder() {
++                        self.source = path.display().to_string();
++                    }
++                }
++            });
++
++            ui.horizontal(|ui| {
++                ui.label("Destination:");
++                ui.text_edit_singleline(&mut self.destination);
++                if ui.button("Browse").clicked() {
++                    if let Some(path) = FileDialog::new().pick_folder() {
++                        self.destination = path.display().to_string();
++                    }
++                }
++            });
++
++            ui.checkbox(&mut self.recursive, "Recursive");
++
++            if ui.button("Create").clicked() {
++                let source_path = std::path::Path::new(&self.source);
++                let dest_path = std::path::Path::new(&self.destination);
++                if let Ok(plan) = plan_links(source_path, dest_path, self.source_mode.clone(), false) {
++                    self.summary = Some(execute_plan(&plan));
++                }
++            }
++
++            if let Some(summary) = &self.summary {
++                ui.label(format!("Created: {}, Skipped: {}, Failures: {}", summary.created_directories + summary.created_file_links, summary.skipped, summary.failures.len()));
++            }
++
++            ui.label(self.get_preview());
++            
++            if ui.button("Close").clicked() {
++                if self.close().is_err() {
++                    // Handle error
++                } else {
++                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
++                }
++            }
++        });
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn default_source_mode_is_directory() {
++        let app = SymbolicLinkApp::default();
++        if let LinkMode::Directory { .. } = app.source_mode {
++            assert!(true);
++        } else {
++            panic!("Expected Directory mode");
++        }
++    }
++
++    #[test]
++    fn file_mode_disables_recursive_option() {
++        let mut app = SymbolicLinkApp::default();
++        app.recursive = true;
++        app.update_mode(LinkMode::File);
++        assert!(!app.recursive);
++    }
++
++    #[test]
++    fn preview_describes_recursive_directory() {
++        let mut app = SymbolicLinkApp::default();
++        app.source = "src".to_string();
++        app.destination = "dest".to_string();
++        app.source_mode = LinkMode::Directory { recursive: true };
++        app.recursive = true;
++        let preview = app.get_preview();
++        assert!(preview.contains("Recursive"));
++        assert!(preview.contains("src"));
++        assert!(preview.contains("dest"));
++    }
++
++    #[test]
++    fn template_send_actions_update_fields() {
++        let mut app = SymbolicLinkApp::default();
++        app.templates[0].source = "template_source".to_string();
++        app.apply_template(0);
++        assert_eq!(app.source, "template_source");
++    }
++
++    #[test]
++    fn close_save_failure_is_reported() {
++        let mut app = SymbolicLinkApp::default();
++        app.force_save_failure = true;
++        let result = app.close();
++        assert!(result.is_err());
++        assert!(app.error_message.is_some());
++    }
++}
+diff --git a/src/main.rs b/src/main.rs
+index 256c46f..1eb678a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -25,10 +25,11 @@ impl Default for MyApp {
+ }
+ 
+ impl eframe::App for MyApp {
+     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+         egui::CentralPanel::default().show(ctx, |ui| {
+             ui.heading("Symbolic Link Creator v2.8");
+             ui.label("Template persistence implemented.");
+         });
+     }
+ }
++mod app;

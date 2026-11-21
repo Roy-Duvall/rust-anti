@@ -1,4 +1,7 @@
 {
     "DockerRun.DisableDockerrc": true,
     "powershell.powerShellDefaultVersion": "C:\\Program Files\\PowerShell\\7\\pwsh.exe"
+
+  "modelflare.modelFilter": "all",
+  "modelflare.includeGatewaySupportedModels": false
 }

@@ -1,0 +1,398 @@
+5936c80 feat: add symbolic-link operation planning
+ Cargo.lock    |   1 +
+ Cargo.toml    |   1 +
+ src/config.rs |   7 ++
+ src/linker.rs | 292 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ src/main.rs   |   1 +
+ 5 files changed, 302 insertions(+)
+diff --git a/Cargo.lock b/Cargo.lock
+index 1bb9483..fa5e641 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2992,20 +2992,21 @@ checksum = "6637bab7722d379c8b41ba849228d680cc12d0a45ba1fa2b48f2a30577a06731"
+ [[package]]
+ name = "symbolic-link-maker"
+ version = "0.1.0"
+ dependencies = [
+  "eframe",
+  "egui",
+  "rfd",
+  "serde",
+  "serde_json",
+  "tempfile",
++ "walkdir",
+  "windows-sys 0.52.0",
+ ]
+ 
+ [[package]]
+ name = "syn"
+ version = "1.0.109"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
+ dependencies = [
+  "proc-macro2",
+diff --git a/Cargo.toml b/Cargo.toml
+index efff204..e58350e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -2,14 +2,15 @@
+ name = "symbolic-link-maker"
+ version = "0.1.0"
+ edition = "2021"
+ 
+ [dependencies]
+ eframe = "0.27"
+ egui = "0.27"
+ rfd = "0.14"
+ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0"
++walkdir = "2.5.0"
+ windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+ 
+ [dev-dependencies]
+ tempfile = "3.10"
+diff --git a/src/config.rs b/src/config.rs
+index 2c193c9..9a9d310 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -1,16 +1,23 @@
+ use std::path::PathBuf;
+ 
+ #[derive(Debug)]
+ pub enum AppError {
+     Io(std::io::Error),
+     Json(serde_json::Error),
++    Validation(String),
++    Overlap(String),
++    Conflict(String),
++    MissingParent(String),
++    NotADirectory(String),
++    NotAFile(String),
++    SymlinkCheck(std::io::Error),
+ }
+ 
+ impl From<std::io::Error> for AppError {
+     fn from(err: std::io::Error) -> Self {
+         AppError::Io(err)
+     }
+ }
+ 
+ impl From<serde_json::Error> for AppError {
+     fn from(err: serde_json::Error) -> Self {
+diff --git a/src/linker.rs b/src/linker.rs
+new file mode 100644
+index 0000000..b70e740
+--- /dev/null
++++ b/src/linker.rs
+@@ -0,0 +1,292 @@
++use std::path::{Path, PathBuf};
++use crate::config::AppError;
++use walkdir::WalkDir;
++
++#[derive(Debug, Clone)]
++pub enum LinkMode {
++    File,
++    Directory { recursive: bool },
++}
++
++#[derive(Debug)]
++pub enum PlannedAction {
++    CreateDirectory,
++    CreateFileLink,
++    CreateDirectoryLink,
++}
++
++#[derive(Debug)]
++pub struct LinkPlan {
++    pub actions: Vec<(PlannedAction, PathBuf, PathBuf)>,
++}
++
++pub struct LinkSummary;
++
++pub fn validate_source(source: &Path, mode: LinkMode) -> Result<(), AppError> {
++    if !source.exists() {
++        return Err(AppError::Validation(format!("Source path does not exist: {}", source.display())));
++    }
++    match mode {
++        LinkMode::File => {
++            if !source.is_file() {
++                return Err(AppError::NotAFile(format!("Source is not a file: {}", source.display())));
++            }
++        }
++        LinkMode::Directory { .. } => {
++            if !source.is_dir() {
++                return Err(AppError::NotADirectory(format!("Source is not a directory: {}", source.display())));
++            }
++        }
++    }
++    Ok(())
++}
++
++pub fn validate_destination(destination: &Path) -> Result<(), AppError> {
++    let parent = destination.parent().ok_or_else(|| {
++        AppError::MissingParent(format!("Destination has no parent directory: {}", destination.display()))
++    })?;
++    if !parent.exists() {
++        return Err(AppError::MissingParent(format!("Destination parent does not exist: {}", parent.display())));
++    }
++    if !parent.is_dir() {
++        return Err(AppError::NotADirectory(format!("Destination parent is not a directory: {}", parent.display())));
++    }
++    Ok(())
++}
++
++pub fn validate_paths(source: &Path, destination: &Path) -> Result<(), AppError> {
++    // Ensure destination is not inside source
++    if destination.starts_with(source) {
++        return Err(AppError::Overlap(format!("Destination {} is inside source {}", destination.display(), source.display())));
++    }
++    // Ensure source is not inside destination (optional but good)
++    if source.starts_with(destination) {
++        return Err(AppError::Overlap(format!("Source {} is inside destination {}", source.display(), destination.display())));
++    }
++    Ok(())
++}
++
++pub fn plan_links(source: &Path, destination: &Path, mode: LinkMode, overwrite: bool) -> Result<LinkPlan, AppError> {
++    validate_source(source, mode.clone())?;
++    validate_destination(destination)?;
++    validate_paths(source, destination)?;
++
++    let mut actions = Vec::new();
++    match mode {
++        LinkMode::File => {
++            let dest_path = destination.join(source.file_name().unwrap());
++            // Check destination collision
++            if dest_path.exists() {
++                let metadata = std::fs::symlink_metadata(&dest_path)?;
++                if metadata.file_type().is_symlink() {
++                    if overwrite {
++                        // Overwrite symlink: we will replace it later
++                        // For planning, we still create action; execution will delete existing symlink
++                    } else {
++                        // Skip: no action added
++                        return Ok(LinkPlan { actions });
++                    }
++                } else {
++                    // Regular file/directory conflict
++                    return Err(AppError::Conflict(format!("Regular file/directory already exists at {}", dest_path.display())));
++                }
++            }
++            actions.push((PlannedAction::CreateFileLink, source.to_path_buf(), dest_path));
++        }
++        LinkMode::Directory { recursive } => {
++            if recursive {
++                // Walk directories recursively
++                for entry in WalkDir::new(source).follow_links(false) {
++                    let entry = entry.map_err(|e| AppError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
++                    let rel_path = entry.path().strip_prefix(source).unwrap();
++                    let dest_path = destination.join(rel_path);
++                    if entry.file_type().is_dir() {
++                        // Directory: ensure directory exists at destination
++                        if !dest_path.exists() {
++                            actions.push((PlannedAction::CreateDirectory, source.to_path_buf(), dest_path));
++                        }
++                    } else if entry.file_type().is_file() {
++                        // File: plan file link
++                        if dest_path.exists() {
++                            let metadata = std::fs::symlink_metadata(&dest_path)?;
++                            if metadata.file_type().is_symlink() {
++                                if overwrite {
++                                    // Overwrite symlink
++                                } else {
++                                    // Skip
++                                    continue;
++                                }
++                            } else {
++                                return Err(AppError::Conflict(format!("Regular file/directory already exists at {}", dest_path.display())));
++                            }
++                        }
++                        actions.push((PlannedAction::CreateFileLink, entry.path().to_path_buf(), dest_path));
++                    }
++                }
++            } else {
++                // Top-level mode: only immediate files
++                for entry in std::fs::read_dir(source)? {
++                    let entry = entry?;
++                    if entry.file_type()?.is_file() {
++                        let dest_path = destination.join(entry.file_name());
++                        if dest_path.exists() {
++                            let metadata = std::fs::symlink_metadata(&dest_path)?;
++                            if metadata.file_type().is_symlink() {
++                                if overwrite {
++                                    // Overwrite symlink
++                                } else {
++                                    continue;
++                                }
++                            } else {
++                                return Err(AppError::Conflict(format!("Regular file/directory already exists at {}", dest_path.display())));
++                            }
++                        }
++                        actions.push((PlannedAction::CreateFileLink, entry.path(), dest_path));
++                    }
++                }
++            }
++        }
++    }
++    Ok(LinkPlan { actions })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use tempfile::tempdir;
++
++    #[test]
++    fn file_mode_maps_source_name_to_destination() {
++        let tmp = tempdir().unwrap();
++        let source = tmp.path().join("file.txt");
++        std::fs::write(&source, "content").unwrap();
++        let dest = tmp.path().join("dest");
++        std::fs::create_dir(&dest).unwrap();
++        let plan = plan_links(&source, &dest, LinkMode::File, false).unwrap();
++        assert_eq!(plan.actions.len(), 1);
++        match &plan.actions[0].0 {
++            PlannedAction::CreateFileLink => {},
++            _ => panic!("Expected CreateFileLink"),
++        }
++    }
++
++    #[test]
++    fn top_level_mode_lists_only_immediate_files() {
++        let tmp = tempdir().unwrap();
++        let source = tmp.path().join("source");
++        std::fs::create_dir(&source).unwrap();
++        std::fs::write(source.join("file1.txt"), "").unwrap();
++        std::fs::write(source.join("file2.txt"), "").unwrap();
++        std::fs::create_dir(source.join("subdir")).unwrap();
++        std::fs::write(source.join("subdir").join("file3.txt"), "").unwrap();
++        let dest = tmp.path().join("dest");
++        std::fs::create_dir(&dest).unwrap();
++        let plan = plan_links(&source, &dest, LinkMode::Directory { recursive: false }, false).unwrap();
++        assert_eq!(plan.actions.len(), 2);
++        for (action, _, _) in plan.actions {
++            match action {
++                PlannedAction::CreateFileLink => {},
++                _ => panic!("Expected only CreateFileLink"),
++            }
++        }
++    }
++
++    #[test]
++    fn recursive_mode_maps_relative_paths_and_directories() {
++        let tmp = tempdir().unwrap();
++        let source = tmp.path().join("source");
++        std::fs::create_dir(&source).unwrap();
++        std::fs::create_dir(source.join("subdir")).unwrap();
++        std::fs::write(source.join("subdir").join("file.txt"), "").unwrap();
++        let dest = tmp.path().join("dest");
++        std::fs::create_dir(&dest).unwrap();
++        let plan = plan_links(&source, &dest, LinkMode::Directory { recursive: true }, false).unwrap();
++        // Expect at least CreateDirectory for subdir and CreateFileLink for file
++        assert!(plan.actions.len() >= 2);
++        let mut dir_created = false;
++        let mut file_link_created = false;
++        for (action, _, _) in plan.actions {
++            match action {
++                PlannedAction::CreateDirectory => dir_created = true,
++                PlannedAction::CreateFileLink => file_link_created = true,
++                _ => {}
++            }
++        }
++        assert!(dir_created);
++        assert!(file_link_created);
++    }
++
++    #[test]
++    fn destination_inside_source_is_rejected() {
++        let tmp = tempdir().unwrap();
++        let source = tmp.path().join("source");
++        std::fs::create_dir(&source).unwrap();
++        let dest = source.join("dest");
++        std::fs::create_dir(&dest).unwrap();
++        let result = validate_paths(&source, &dest);
++        assert!(result.is_err());
++        match result.unwrap_err() {
++            AppError::Overlap(_) => {},
++            _ => panic!("Expected Overlap error"),
++        }
++    }
++
++    #[test]
++    fn existing_regular_destination_is_conflict() {
++        let tmp = tempdir().unwrap();
++        let source = tmp.path().join("file.txt");
++        std::fs::write(&source, "content").unwrap();
++        let dest = tmp.path().join("dest");
++        std::fs::create_dir(&dest).unwrap();
++        let existing = dest.join("file.txt");
++        std::fs::write(&existing, "existing").unwrap();
++        let result = plan_links(&source, &dest, LinkMode::File, false);
++        assert!(result.is_err());
++        match result.unwrap_err() {
++            AppError::Conflict(_) => {},
++            _ => panic!("Expected Conflict error"),
++        }
++    }
++
++    #[test]
++    fn existing_symlink_is_create_or_skip_based_on_overwrite() {
++        let tmp = tempdir().unwrap();
++        let source = tmp.path().join("file.txt");
++        std::fs::write(&source, "content").unwrap();
++        let dest = tmp.path().join("dest");
++        std::fs::create_dir(&dest).unwrap();
++        let symlink_path = dest.join("file.txt");
++        // Attempt to create symlink; if fails due to privilege, skip test
++        match std::os::windows::fs::symlink_file(&source, &symlink_path) {
++            Ok(_) => {
++                // With overwrite false, should skip (no actions)
++                let plan = plan_links(&source, &dest, LinkMode::File, false).unwrap();
++                assert_eq!(plan.actions.len(), 0);
++                // With overwrite true, should create action (overwrite)
++                let plan = plan_links(&source, &dest, LinkMode::File, true).unwrap();
++                assert_eq!(plan.actions.len(), 1);
++            }
++            Err(e) if e.raw_os_error() == Some(1314) => {
++                // Privilege not held; skip test
++                println!("Skipping symlink test due to missing privilege");
++            }
++            Err(e) => panic!("Failed to create symlink: {}", e),
++        }
++    }
++
++    #[test]
++    fn missing_destination_parent_is_rejected() {
++        let tmp = tempdir().unwrap();
++        let source = tmp.path().join("file.txt");
++        std::fs::write(&source, "content").unwrap();
++        let dest = tmp.path().join("nonexistent").join("dest");
++        let result = validate_destination(&dest);
++        assert!(result.is_err());
++        match result.unwrap_err() {
++            AppError::MissingParent(_) => {},
++            _ => panic!("Expected MissingParent error"),
++        }
++    }
++}
++
++
+diff --git a/src/main.rs b/src/main.rs
+index 0ec9902..237f7d7 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,13 +1,14 @@
+ use eframe::egui;
+ 
+ mod config;
++mod linker;
+ 
+ fn main() -> Result<(), eframe::Error> {
+     let options = eframe::NativeOptions {
+         viewport: egui::ViewportBuilder::default().with_inner_size([800.0, 600.0]),
+         ..Default::default()
+     };
+     eframe::run_native(
+         "Symbolic Link Creator v2.8",
+         options,
+         Box::new(|_cc| Box::<MyApp>::default()),
